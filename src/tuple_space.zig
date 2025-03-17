@@ -205,6 +205,25 @@ pub const TupleSpace = struct {
         self.entries.deinit();
     }
 
+    export fn tuplespace_read_string(ts: *TupleSpace, ptr: [*c]const u8, len: usize, out_ptr: *[*c]u8, out_len: *usize) callconv(.C) c_int {
+        var elements = ts.allocator.alloc(tuple.Element, 1) catch return 1;
+        defer ts.allocator.free(elements);
+        const match_str = ts.allocator.dupe(u8, ptr[0..len]) catch return 1;
+        defer ts.allocator.free(match_str);
+        elements[0] = .{ .tag = .String, .data = .{ .String = .{ .ptr = match_str, .len = len } } };
+        const template = tuple.Tuple.init(ts.allocator, elements) catch return 1;
+        defer {
+            template.deinit();
+            ts.allocator.destroy(template);
+        }
+        if (ts.read(template)) |entry| {
+            out_ptr.* = @constCast(entry.tuple.elements[0].data.String.ptr).ptr;
+            out_len.* = entry.tuple.elements[0].data.String.len;
+            return 0;
+        }
+        return 1;
+    }
+
     // Adds a tuple to the tuple space, wrapping it in a TupleSpaceEntry.
     // Thread-safe: locks the mutex during insertion to prevent concurrent modifications.
     // - t: Pointer to the Tuple to add (ownership transferred to the TupleSpace).
