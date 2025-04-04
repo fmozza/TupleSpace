@@ -1,0 +1,573 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <openssl/rand.h>
+#include "network.h"
+#include "crypto.h"
+
+int main()
+{
+    EVP_PKEY *server_key = load_private_key("keys/server_01_key.pem");
+    if (!server_key)
+        return 1;
+
+    unsigned char server_pub[32];
+    size_t pub_len = 32;
+    if (get_public_key(server_key, server_pub, &pub_len) < 0)
+        return 1;
+
+    int server_fd = setup_server_socket();
+    if (server_fd < 0)
+        return 1;
+
+    int client_fd = accept_client(server_fd);
+    if (client_fd < 0)
+    {
+        close(server_fd);
+        return 1;
+    }
+
+    unsigned char client_pub[32];
+    if (receive_public_key(client_fd, client_pub, 32) < 0)
+    {
+        close(client_fd);
+        close(server_fd);
+        return 1;
+    }
+    EVP_PKEY *client_key = create_public_key(client_pub, 32);
+    if (!client_key)
+    {
+        close(client_fd);
+        close(server_fd);
+        return 1;
+    }
+
+    if (send_public_key(client_fd, server_pub, pub_len) < 0)
+    {
+        close(client_fd);
+        close(server_fd);
+        return 1;
+    }
+
+    unsigned char session_key[KEY_LEN];
+    if (derive_session_key(server_key, client_key, session_key) < 0)
+    {
+        close(client_fd);
+        close(server_fd);
+        return 1;
+    }
+    printf("Server session key: ");
+    for (int i = 0; i < 8; i++)
+        printf("%02x", session_key[i]);
+    printf("...\n");
+
+    unsigned char *msg;
+    uint32_t msg_len;
+    if (receive_message(client_fd, &msg, &msg_len) < 0)
+    {
+        close(client_fd);
+        close(server_fd);
+        return 1;
+    }
+
+    unsigned char *nonce = msg;
+    unsigned char *ciphertext = msg + NONCE_LEN;
+    size_t cipher_len = msg_len - NONCE_LEN;
+
+    unsigned char *plaintext;
+    int plaintext_len;
+    if (decrypt_message(session_key, nonce, ciphertext, cipher_len, &plaintext, &plaintext_len) < 0)
+    {
+        free(msg);
+        close(client_fd);
+        close(server_fd);
+        return 1;
+    }
+    printf("Server decrypted: %.*s\n", plaintext_len, plaintext);
+
+    const char *response = "Hello from server";
+    unsigned char nonce_out[NONCE_LEN];
+    if (RAND_bytes(nonce_out, NONCE_LEN) != 1)
+    {
+        perror("nonce");
+        free(msg);
+        free(plaintext);
+        close(client_fd);
+        close(server_fd);
+        return 1;
+    }
+    unsigned char *resp_cipher;
+    int resp_cipher_len;
+    if (encrypt_message(session_key, nonce_out, response, strlen(response), &resp_cipher, &resp_cipher_len) < 0)
+    {
+        free(msg);
+        free(plaintext);
+        close(client_fd);
+        close(server_fd);
+        return 1;
+    }
+    printf("Prepared response, ciphertext length: %d\n", resp_cipher_len);
+
+    if (send_message(client_fd, nonce_out, resp_cipher, resp_cipher_len) < 0)
+    {
+        free(msg);
+        free(plaintext);
+        free(resp_cipher);
+        close(client_fd);
+        close(server_fd);
+        return 1;
+    }
+
+    free(msg);
+    free(plaintext);
+    free(resp_cipher);
+    // Removed: usleep(1000);
+    shutdown(client_fd, SHUT_RDWR);
+    close(client_fd);
+    shutdown(server_fd, SHUT_RDWR);
+    close(server_fd);
+    EVP_PKEY_free(server_key);
+    EVP_PKEY_free(client_key);
+    return 0;
+}#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include "network.h"
+
+int setup_server_socket()
+{
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0)
+    {
+        perror("socket");
+        return -1;
+    }
+
+    int opt = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0)
+    {
+        perror("setsockopt SO_REUSEADDR");
+        return -1;
+    }
+
+    struct sockaddr_in addr = {AF_INET, htons(PORT), {INADDR_ANY}, {0}};
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+    {
+        perror("bind");
+        return -1;
+    }
+    if (listen(server_fd, 1) < 0)
+    {
+        perror("listen");
+        return -1;
+    }
+    printf("Server listening on port %d...\n", PORT);
+    return server_fd;
+}
+
+int accept_client(int server_fd)
+{
+    int client_fd = accept(server_fd, NULL, NULL);
+    if (client_fd < 0)
+    {
+        perror("accept");
+        return -1;
+    }
+    int flag = 1;
+    if (setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(int)) < 0)
+    {
+        perror("setsockopt TCP_NODELAY");
+        return -1;
+    }
+    return client_fd;
+}
+
+int send_public_key(int client_fd, unsigned char *pub_key, size_t pub_len)
+{
+    ssize_t bytes_written = write(client_fd, pub_key, pub_len);
+    if (bytes_written != pub_len)
+    {
+        perror("write server pub");
+        printf("Wrote %zd/%zu bytes\n", bytes_written, pub_len);
+        return -1;
+    }
+    printf("Sent public key: %zd bytes\n", bytes_written);
+    return 0;
+}
+
+int receive_public_key(int client_fd, unsigned char *pub_key, size_t pub_len)
+{
+    ssize_t bytes_read = read(client_fd, pub_key, pub_len);
+    if (bytes_read != pub_len)
+    {
+        perror("read client pub");
+        printf("Read %zd/%zu bytes\n", bytes_read, pub_len);
+        return -1;
+    }
+    printf("Received public key: %zd bytes\n", bytes_read);
+    return 0;
+}
+
+int receive_message(int client_fd, unsigned char **msg, uint32_t *msg_len)
+{
+    uint32_t total_len;
+    ssize_t bytes_read = read(client_fd, &total_len, sizeof(total_len));
+    if (bytes_read != sizeof(total_len))
+    {
+        perror("read msg len");
+        printf("Read %zd/%zu bytes for length\n", bytes_read, sizeof(total_len));
+        return -1;
+    }
+    total_len = ntohl(total_len);
+    printf("Received total message length (including prefix): %u\n", total_len);
+
+    if (total_len < 4)
+    {
+        printf("Invalid length: %u\n", total_len);
+        return -1;
+    }
+    *msg_len = total_len - 4;
+    printf("Payload length to read: %u\n", *msg_len);
+
+    *msg = malloc(*msg_len);
+    if (!*msg)
+    {
+        perror("malloc msg");
+        return -1;
+    }
+
+    size_t total_read = 0;
+    while (total_read < *msg_len)
+    {
+        bytes_read = read(client_fd, *msg + total_read, *msg_len - total_read);
+        if (bytes_read < 0)
+        {
+            perror("read msg");
+            printf("Bytes read: %zd, total %zu/%u\n", bytes_read, total_read, *msg_len);
+            free(*msg);
+            return -1;
+        }
+        if (bytes_read == 0)
+        {
+            printf("Connection closed by client: expected %u, got %zu\n", *msg_len, total_read);
+            free(*msg);
+            return -1;
+        }
+        total_read += bytes_read;
+        printf("Read %zd bytes, total %zu/%u, raw: ", bytes_read, total_read, *msg_len);
+        for (size_t i = total_read - bytes_read; i < total_read; i++)
+        {
+            printf("%02x", (*msg)[i]);
+        }
+        printf("\n");
+    }
+    printf("Message read successfully, %zu bytes\n", total_read);
+    return 0;
+}
+
+int send_message(int client_fd, unsigned char *nonce, unsigned char *ciphertext, int cipher_len)
+{
+    uint32_t total_len = htonl(4 + NONCE_LEN + cipher_len); // Fixed: Include nonce length
+    ssize_t bytes_written = write(client_fd, &total_len, 4);
+    if (bytes_written != 4)
+    {
+        perror("write total len");
+        printf("Wrote %zd/4 bytes\n", bytes_written);
+        return -1;
+    }
+    printf("Sent length: %zd bytes\n", bytes_written);
+
+    bytes_written = write(client_fd, nonce, NONCE_LEN);
+    if (bytes_written != NONCE_LEN)
+    {
+        perror("write nonce");
+        printf("Wrote %zd/%d bytes\n", bytes_written, NONCE_LEN);
+        return -1;
+    }
+    printf("Sent nonce: %zd bytes\n", bytes_written);
+
+    bytes_written = write(client_fd, ciphertext, cipher_len);
+    if (bytes_written != cipher_len)
+    {
+        perror("write ciphertext");
+        printf("Wrote %zd/%d bytes\n", bytes_written, cipher_len);
+        return -1;
+    }
+    printf("Sent message: %zd bytes\n", bytes_written);
+    printf("Response sent successfully\n");
+    return 0;
+}// crypto.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <openssl/evp.h>
+#include <openssl/kdf.h>
+#include <openssl/rand.h>
+#include <openssl/err.h>
+#include <openssl/pem.h>
+#include <openssl/params.h>
+#include "crypto.h"
+
+EVP_PKEY *load_private_key(const char *filename)
+{
+    FILE *fp = fopen(filename, "r");
+    if (!fp)
+    {
+        perror("fopen key");
+        return NULL;
+    }
+    EVP_PKEY *key = PEM_read_PrivateKey(fp, NULL, NULL, NULL);
+    fclose(fp);
+    if (!key)
+    {
+        perror("PEM_read_PrivateKey");
+        return NULL;
+    }
+    return key;
+}
+
+int get_public_key(EVP_PKEY *key, unsigned char *pub_key, size_t *pub_len)
+{
+    if (EVP_PKEY_get_raw_public_key(key, pub_key, pub_len) != 1)
+    {
+        perror("get pubkey");
+        return -1;
+    }
+    return 0;
+}
+
+EVP_PKEY *create_public_key(unsigned char *pub_key, size_t pub_len)
+{
+    EVP_PKEY *key = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, pub_key, pub_len);
+    if (!key)
+    {
+        perror("create pub key");
+        return NULL;
+    }
+    return key;
+}
+
+int derive_session_key(EVP_PKEY *priv_key, EVP_PKEY *peer_key, unsigned char *session_key)
+{
+    unsigned char shared_secret[32];
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(priv_key, NULL);
+    if (!ctx || EVP_PKEY_derive_init(ctx) <= 0 || EVP_PKEY_derive_set_peer(ctx, peer_key) <= 0)
+    {
+        perror("derive init");
+        return -1;
+    }
+    size_t secret_len = 32;
+    if (EVP_PKEY_derive(ctx, shared_secret, &secret_len) <= 0)
+    {
+        perror("derive");
+        EVP_PKEY_CTX_free(ctx);
+        return -1;
+    }
+    EVP_PKEY_CTX_free(ctx);
+
+    unsigned char server_pub[32];
+    size_t pub_len = 32;
+    if (EVP_PKEY_get_raw_public_key(priv_key, server_pub, &pub_len) != 1)
+    {
+        perror("get server pub");
+        return -1;
+    }
+
+    EVP_KDF *kdf = EVP_KDF_fetch(NULL, "HKDF", NULL);
+    EVP_KDF_CTX *kdf_ctx = EVP_KDF_CTX_new(kdf);
+    OSSL_PARAM params[] = {
+        OSSL_PARAM_construct_utf8_string("mode", "EXTRACT_AND_EXPAND", 0),
+        OSSL_PARAM_construct_utf8_string("digest", "SHA256", 0),
+        OSSL_PARAM_construct_octet_string("key", shared_secret, 32),
+        OSSL_PARAM_construct_octet_string("salt", server_pub, 32),
+        OSSL_PARAM_construct_octet_string("info", (unsigned char *)"test_server", 11),
+        OSSL_PARAM_construct_end()};
+    if (!kdf_ctx || EVP_KDF_derive(kdf_ctx, session_key, KEY_LEN, params) <= 0)
+    {
+        perror("hkdf");
+        fprintf(stderr, "OpenSSL error: %s\n", ERR_error_string(ERR_get_error(), NULL));
+        EVP_KDF_CTX_free(kdf_ctx);
+        EVP_KDF_free(kdf);
+        return -1;
+    }
+    EVP_KDF_CTX_free(kdf_ctx);
+    EVP_KDF_free(kdf);
+    return 0;
+}
+
+int decrypt_message(unsigned char *session_key, unsigned char *nonce, unsigned char *ciphertext, size_t cipher_len, unsigned char **plaintext, int *plaintext_len)
+{
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx || EVP_DecryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, session_key, nonce) != 1)
+    {
+        perror("decrypt init");
+        return -1;
+    }
+    unsigned char tag[16];
+    memcpy(tag, ciphertext + (cipher_len - 16), 16);
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16, tag) != 1)
+    {
+        perror("set tag");
+        EVP_CIPHER_CTX_free(ctx);
+        return -1;
+    }
+    *plaintext = malloc(cipher_len - 16);
+    int len;
+    if (EVP_DecryptUpdate(ctx, *plaintext, &len, ciphertext, cipher_len - 16) != 1)
+    {
+        perror("decrypt update");
+        EVP_CIPHER_CTX_free(ctx);
+        return -1;
+    }
+    *plaintext_len = len;
+    if (EVP_DecryptFinal_ex(ctx, *plaintext + len, &len) != 1)
+    {
+        perror("decrypt final");
+        EVP_CIPHER_CTX_free(ctx);
+        return -1;
+    }
+    *plaintext_len += len;
+    EVP_CIPHER_CTX_free(ctx);
+    return 0;
+}
+
+int encrypt_message(unsigned char *session_key, unsigned char *nonce, const char *message, size_t msg_len, unsigned char **ciphertext, int *cipher_len)
+{
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx || EVP_EncryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, session_key, nonce) != 1)
+    {
+        perror("encrypt init");
+        return -1;
+    }
+    *ciphertext = malloc(msg_len + 16);
+    int len;
+    if (EVP_EncryptUpdate(ctx, *ciphertext, &len, (unsigned char *)message, msg_len) != 1)
+    {
+        perror("encrypt update");
+        EVP_CIPHER_CTX_free(ctx);
+        return -1;
+    }
+    *cipher_len = len;
+    if (EVP_EncryptFinal_ex(ctx, *ciphertext + len, &len) != 1)
+    {
+        perror("encrypt final");
+        EVP_CIPHER_CTX_free(ctx);
+        return -1;
+    }
+    *cipher_len += len;
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, *ciphertext + *cipher_len) != 1)
+    {
+        perror("get tag");
+        EVP_CIPHER_CTX_free(ctx);
+        return -1;
+    }
+    *cipher_len += 16;
+    EVP_CIPHER_CTX_free(ctx);
+    return 0;
+}#ifndef NETWORK_H
+#define NETWORK_H
+
+#include <stdint.h>
+
+#define PORT 12345
+#define NONCE_LEN 12  // For ChaCha20Poly1305
+#define SPACE_ID_LEN 32  // Unused now, kept for future
+
+int setup_server_socket();
+int accept_client(int server_fd);
+int send_public_key(int client_fd, unsigned char* pub_key, size_t pub_len);
+int receive_public_key(int client_fd, unsigned char* pub_key, size_t pub_len);
+int receive_message(int client_fd, unsigned char** msg, uint32_t* msg_len);
+int send_message(int client_fd, unsigned char* nonce, unsigned char* ciphertext, int cipher_len);
+
+#endif// crypto.h
+#ifndef CRYPTO_H
+#define CRYPTO_H
+
+#include <openssl/evp.h>
+
+#define KEY_LEN 32
+
+EVP_PKEY *load_private_key(const char *filename);
+int get_public_key(EVP_PKEY *key, unsigned char *pub_key, size_t *pub_len);
+EVP_PKEY *create_public_key(unsigned char *pub_key, size_t pub_len);
+int derive_session_key(EVP_PKEY *priv_key, EVP_PKEY *peer_key, unsigned char *session_key);
+int decrypt_message(unsigned char *session_key, unsigned char *nonce, unsigned char *ciphertext, size_t cipher_len, unsigned char **plaintext, int *plaintext_len);
+int encrypt_message(unsigned char *session_key, unsigned char *nonce, const char *message, size_t msg_len, unsigned char **ciphertext, int *cipher_len);
+
+#endifimport socket
+import os
+from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes, serialization
+import struct
+
+with open("keys/client_01_key.pem", "rb") as f:
+    client_priv = x25519.X25519PrivateKey.from_private_bytes(
+        serialization.load_pem_private_key(f.read(), password=None).private_bytes_raw()
+    )
+client_pub = client_priv.public_key().public_bytes_raw()
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+sock.connect(("localhost", 12345))
+
+sock.sendall(client_pub)
+server_pub = sock.recv(32)
+
+shared_secret = client_priv.exchange(x25519.X25519PublicKey.from_public_bytes(server_pub))
+hkdf = HKDF(
+    algorithm=hashes.SHA256(),
+    length=32,
+    salt=server_pub,
+    info=b"test_server"
+)
+session_key = hkdf.derive(shared_secret)
+print(f"Client session key: {session_key[:8].hex()}...")
+
+message = b"Hello from client"
+nonce = os.urandom(12)
+cipher = ChaCha20Poly1305(session_key)
+ciphertext = cipher.encrypt(nonce, message, None)
+msg = struct.pack(">I", 4 + len(nonce) + len(ciphertext)) + nonce + ciphertext
+print(f"Preparing message, length: {len(msg)}, raw: {msg.hex()}")
+sock.sendall(msg)
+print(f"Sent message: {len(msg)} bytes")
+
+length_data = b""
+while len(length_data) < 4:
+    chunk = sock.recv(4 - len(length_data))
+    if not chunk:
+        print("Server closed connection early")
+        break
+    length_data += chunk
+    print(f"Received length chunk: {len(chunk)} bytes, raw: {chunk.hex()}")
+print(f"Received length data: {len(length_data)} bytes, raw: {length_data.hex()}")
+total_len = struct.unpack(">I", length_data)[0]
+payload_len = total_len - 4  # Expect payload after length prefix
+print(f"Expected payload length: {payload_len}")
+
+resp_data = b""
+while len(resp_data) < payload_len:
+    chunk = sock.recv(payload_len - len(resp_data))
+    if not chunk:
+        print("Server closed connection early during response")
+        break
+    resp_data += chunk
+    print(f"Received response chunk: {len(chunk)} bytes, raw: {chunk.hex()}")
+print(f"Received response data: {len(resp_data)} bytes")
+nonce = resp_data[:12]
+ciphertext = resp_data[12:]
+plaintext = cipher.decrypt(nonce, ciphertext, None)
+print(f"Client received: {plaintext.decode()}")
+
+sock.close()

@@ -1,0 +1,394 @@
+# cython_tuple_client.pyx
+from libc.stdlib cimport malloc, free
+from libc.string cimport memcpy, memset
+from libc.stdint cimport int64_t, uint64_t, uint8_t, uint32_t
+from posix.unistd cimport close
+from libc.stddef cimport size_t
+
+cdef extern from "sys/types.h":
+    ctypedef long ssize_t
+
+cdef extern from "sys/socket.h":
+    int socket(int domain, int type, int protocol)
+    int connect(int sockfd, const void *addr, size_t addrlen)
+    ssize_t send(int sockfd, const void *buf, size_t len, int flags)
+    ssize_t recv(int sockfd, void *buf, size_t len, int flags)
+    int AF_INET
+    int SOCK_STREAM
+
+cdef extern from "stdio.h":
+    ctypedef struct FILE:
+        pass
+    FILE *stdout
+    FILE *fopen(const char *path, const char *mode)
+    int fclose(FILE *fp)
+
+cdef extern from "arpa/inet.h":
+    uint32_t htonl(uint32_t hostlong)
+    uint32_t ntohl(uint32_t netlong)
+
+cdef extern from "openssl/evp.h":
+    ctypedef struct EVP_PKEY:
+        pass
+    ctypedef struct EVP_PKEY_CTX:
+        pass
+    int EVP_PKEY_X25519
+    EVP_PKEY *EVP_PKEY_new_raw_public_key(int type, void *unused, const unsigned char *key, size_t len)
+    int EVP_PKEY_get_raw_public_key(EVP_PKEY *pkey, unsigned char *pub, size_t *len)
+    void EVP_PKEY_free(EVP_PKEY *pkey)
+    EVP_PKEY_CTX *EVP_PKEY_CTX_new(EVP_PKEY *pkey, void *engine)
+    int EVP_PKEY_derive_init(EVP_PKEY_CTX *ctx)
+    int EVP_PKEY_derive_set_peer(EVP_PKEY_CTX *ctx, EVP_PKEY *peer)
+    int EVP_PKEY_derive(EVP_PKEY_CTX *ctx, unsigned char *key, size_t *keylen)
+    void EVP_PKEY_CTX_free(EVP_PKEY_CTX *ctx)
+
+cdef extern from "openssl/pem.h":
+    EVP_PKEY *PEM_read_PrivateKey(FILE *fp, EVP_PKEY **x, void *cb, void *u)
+
+cdef extern from "openssl/err.h":
+    unsigned long ERR_get_error()
+    char *ERR_error_string(unsigned long e, char *buf)
+
+cdef extern from "tuple.h":
+    ctypedef enum ElementTag:
+        ELEMENT_INT
+        ELEMENT_FLOAT
+        ELEMENT_STRING
+        ELEMENT_TUPLE
+        ELEMENT_INT_ARRAY
+        ELEMENT_FLOAT_ARRAY
+        ELEMENT_WILDCARD
+
+    ctypedef struct String:
+        const char *ptr
+        size_t len
+
+    ctypedef struct IntArray:
+        const int64_t *ptr
+        size_t len
+
+    ctypedef union ElementData:
+        int64_t Int
+        double Float
+        String String
+        IntArray IntArray
+
+    ctypedef struct Element:
+        ElementTag tag
+        ElementData data
+
+    ctypedef struct Tuple:
+        uint64_t id
+        char space_id[32]
+        char label[32]
+        Element *elements
+        size_t elements_len
+        uint64_t client_id
+        uint64_t resource_id
+        uint64_t request_id
+        int64_t timestamp
+
+    Tuple *tuple_init(size_t elements_len)
+    void tuple_set_element(Tuple *self, size_t index, ElementTag tag, ElementData data)
+    void tuple_deinit(Tuple *self)
+    int tuple_serialize(const Tuple *self, uint8_t **buffer, size_t *len)
+    Tuple *tuple_deserialize(uint8_t **buffer, size_t len)
+    void tuple_print(const Tuple *self, FILE *writer)
+    size_t tuple_size(const Tuple *self)
+
+cdef extern from "tuple_space.h":
+    cdef enum:
+        OP_PUT = 0
+        OP_TAKE = 1
+        OP_GET = 2
+        OP_REMOVE = 3
+        OP_RLIST = 4
+
+cdef extern from "tuple_encrypt.h":
+    void encrypt_generate_nonce(unsigned char *nonce, size_t len)
+    int encrypt_tuple_encrypt(const unsigned char *plaintext, size_t plaintext_len,
+                              const unsigned char *key, const unsigned char *nonce,
+                              unsigned char *ciphertext, int *ciphertext_len)
+    int encrypt_tuple_decrypt(const unsigned char *ciphertext, size_t ciphertext_len,
+                              const unsigned char *key, const unsigned char *nonce,
+                              unsigned char *plaintext, int *plaintext_len)
+
+cdef extern from "tuple_network_client.c":
+    int network_connect_client(const char *host, int port, int *clientfd)
+
+cdef class PyTuple:
+    cdef Tuple *c_tuple
+
+    def __cinit__(self, size_t elements_len):
+        self.c_tuple = tuple_init(elements_len)
+        if self.c_tuple == NULL:
+            raise MemoryError("Failed to initialize Tuple")
+
+    def __dealloc__(self):
+        if self.c_tuple != NULL:
+            print("Deallocating tuple at %p" % <void *>self.c_tuple)
+            tuple_deinit(self.c_tuple)
+            self.c_tuple = NULL
+
+    def set_element(self, size_t index, tag, data):
+        cdef ElementData ed
+        cdef bytes b_data
+        cdef char *str_copy
+        if tag == "int":
+            ed.Int = data
+            tuple_set_element(self.c_tuple, index, ELEMENT_INT, ed)
+        elif tag == "float":
+            ed.Float = data
+            tuple_set_element(self.c_tuple, index, ELEMENT_FLOAT, ed)
+        elif tag == "string":
+            b_data = data.encode('utf-8')
+            str_copy = <char *>malloc(len(b_data) + 1)
+            if str_copy == NULL:
+                raise MemoryError("Failed to allocate string copy")
+            memcpy(str_copy, <char *>b_data, len(b_data))
+            str_copy[len(b_data)] = 0  # Null-terminate
+            ed.String.ptr = str_copy
+            ed.String.len = len(b_data)
+            tuple_set_element(self.c_tuple, index, ELEMENT_STRING, ed)
+        else:
+            raise ValueError(f"Unsupported element tag: {tag}")
+
+    def print(self):
+        tuple_print(self.c_tuple, stdout)
+
+cdef class TupleClient:
+    cdef int clientfd
+    cdef unsigned char session_key[32]
+    cdef unsigned char nonce[12]
+    cdef EVP_PKEY *client_key
+
+    def __cinit__(self, host: str = "reimann", port: int = 42420):
+        cdef bytes b_host = host.encode('utf-8')
+        cdef FILE *fp
+        cdef char *key_path = "/usr/local/tuple_space/.keys/client_01_key.pem"
+        cdef unsigned long err
+        cdef char err_buf[256]
+        cdef EVP_PKEY *server_key
+        cdef unsigned char client_pub_key[32]
+        cdef size_t client_pub_len = 32
+        cdef unsigned char server_pub_key[32]
+        cdef EVP_PKEY_CTX *ctx
+        cdef size_t secret_len = 32
+
+        if network_connect_client(b_host, port, &self.clientfd) != 0:
+            raise RuntimeError("Failed to connect to tuple server")
+
+        fp = fopen(key_path, "r")
+        if fp == NULL:
+            raise RuntimeError("Failed to open client key file")
+        self.client_key = PEM_read_PrivateKey(fp, NULL, NULL, NULL)
+        fclose(fp)
+        if self.client_key == NULL:
+            err = ERR_get_error()
+            ERR_error_string(err, err_buf)
+            raise RuntimeError(f"Failed to load client key: {err_buf.decode('utf-8')}")
+
+        if EVP_PKEY_get_raw_public_key(self.client_key, client_pub_key, &client_pub_len) != 1 or client_pub_len != 32:
+            err = ERR_get_error()
+            ERR_error_string(err, err_buf)
+            raise RuntimeError(f"Failed to extract client public key: {err_buf.decode('utf-8')}")
+        print(f"Client pubkey: {client_pub_key[:4].hex()}... ({client_pub_len} bytes)")
+        if send(self.clientfd, client_pub_key, 32, 0) != 32:
+            raise RuntimeError("Failed to send client public key")
+
+        cdef ssize_t recvd = recv(self.clientfd, server_pub_key, 32, 0)
+        if recvd != 32:
+            raise RuntimeError(f"Failed to receive server public key: got {recvd} bytes, expected 32")
+        print(f"Received server pubkey: {server_pub_key[:4].hex()}... ({recvd} bytes)")
+
+        server_key = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, server_pub_key, 32)
+        if server_key == NULL:
+            err = ERR_get_error()
+            ERR_error_string(err, err_buf)
+            raise RuntimeError(f"Failed to load server key: {err_buf.decode('utf-8')}")
+
+        ctx = EVP_PKEY_CTX_new(self.client_key, NULL)
+        if ctx == NULL:
+            EVP_PKEY_free(server_key)
+            raise RuntimeError("Failed to create EVP_PKEY_CTX")
+        if EVP_PKEY_derive_init(ctx) <= 0:
+            EVP_PKEY_CTX_free(ctx)
+            EVP_PKEY_free(server_key)
+            raise RuntimeError("Failed to init key derivation")
+        if EVP_PKEY_derive_set_peer(ctx, server_key) <= 0:
+            EVP_PKEY_CTX_free(ctx)
+            EVP_PKEY_free(server_key)
+            raise RuntimeError("Failed to set peer key")
+        if EVP_PKEY_derive(ctx, self.session_key, &secret_len) <= 0:
+            err = ERR_get_error()
+            ERR_error_string(err, err_buf)
+            EVP_PKEY_CTX_free(ctx)
+            EVP_PKEY_free(server_key)
+            raise RuntimeError(f"Failed to derive session key: {err_buf.decode('utf-8')}")
+        print(f"Session key: {self.session_key.hex()}")
+        EVP_PKEY_CTX_free(ctx)
+        EVP_PKEY_free(server_key)
+
+        encrypt_generate_nonce(self.nonce, 12)
+        print(f"Nonce: {self.nonce.hex()}")
+
+    def __dealloc__(self):
+        if self.clientfd >= 0:
+            print("Closing client socket %d" % self.clientfd)
+            close(self.clientfd)
+        if self.client_key != NULL:
+            print("Freeing client key at %p" % <void *>self.client_key)
+            EVP_PKEY_free(self.client_key)
+            self.client_key = NULL
+
+    cdef object send_request(self, uint8_t op, PyTuple t, uint64_t id=0):
+        cdef uint8_t *tuple_buffer = NULL
+        cdef size_t tuple_len = 0
+        cdef size_t t_size = 0
+        cdef int ciphertext_len
+        cdef unsigned char *ciphertext
+        cdef uint64_t tuple_id
+        cdef Tuple *resp_tuple
+        cdef int status
+        cdef PyTuple py_t
+        cdef uint32_t msg_len
+        cdef unsigned char space_id[32]
+        cdef unsigned char *msg_buffer
+        cdef unsigned char *tag
+
+        if t is not None:
+            t_size = tuple_size(t.c_tuple)
+            if t_size == 0:
+                raise RuntimeError("Failed to get tuple size or tuple is empty")
+            tuple_buffer = <uint8_t *>malloc(t_size)
+            if tuple_buffer == NULL:
+                raise MemoryError("Failed to allocate tuple buffer")
+            if tuple_serialize(t.c_tuple, &tuple_buffer, &tuple_len) != 0:
+                free(tuple_buffer)
+                raise RuntimeError("Failed to serialize tuple")
+
+        cdef size_t header_len = 1
+        cdef size_t total_len
+        cdef unsigned char *plaintext
+        if op == OP_GET or op == OP_REMOVE:
+            total_len = header_len + sizeof(uint64_t)
+            plaintext = <unsigned char *>malloc(total_len)
+            if plaintext == NULL:
+                raise MemoryError("Failed to allocate request buffer")
+            plaintext[0] = op
+            (<uint64_t *>(plaintext + 1))[0] = id
+        else:
+            total_len = header_len + tuple_len
+            plaintext = <unsigned char *>malloc(total_len)
+            if plaintext == NULL:
+                if tuple_buffer != NULL:
+                    free(tuple_buffer)
+                raise MemoryError("Failed to allocate request buffer")
+            plaintext[0] = op
+            if tuple_buffer != NULL:
+                memcpy(plaintext + 1, tuple_buffer, tuple_len)
+                free(tuple_buffer)
+
+        ciphertext_len = total_len + 16
+        ciphertext = <unsigned char *>malloc(ciphertext_len)
+        if ciphertext == NULL:
+            free(plaintext)
+            raise MemoryError("Failed to allocate ciphertext buffer")
+        
+        if encrypt_tuple_encrypt(plaintext, total_len, self.session_key, self.nonce,
+                                 ciphertext, &ciphertext_len) != 0:
+            free(plaintext)
+            free(ciphertext)
+            raise RuntimeError("Failed to encrypt request")
+
+        cdef size_t cipher_only_len = ciphertext_len - 16
+        tag = ciphertext + cipher_only_len
+        print(f"Ciphertext len: {cipher_only_len}, Tag: {tag[:4].hex()}...")
+
+        free(plaintext)
+
+        cdef size_t nonce_len = 12
+        cdef size_t space_id_len = 32
+        cdef size_t raw_msg_len = nonce_len + space_id_len + ciphertext_len
+        msg_buffer = <unsigned char *>malloc(raw_msg_len + 4)
+        if msg_buffer == NULL:
+            free(ciphertext)
+            raise MemoryError("Failed to allocate message buffer")
+
+        print(f"Sending raw_msg_len: {raw_msg_len} (total: {raw_msg_len + 4})")
+        msg_len = htonl(raw_msg_len)
+        memcpy(msg_buffer, &msg_len, 4)
+        memcpy(msg_buffer + 4, self.nonce, nonce_len)
+        memset(space_id, 0, space_id_len)
+        memcpy(msg_buffer + 4 + nonce_len, space_id, space_id_len)
+        memcpy(msg_buffer + 4 + nonce_len + space_id_len, ciphertext, ciphertext_len)
+        free(ciphertext)
+
+        cdef ssize_t sent = send(self.clientfd, msg_buffer, raw_msg_len + 4, 0)
+        free(msg_buffer)
+        if sent != <ssize_t>(raw_msg_len + 4):
+            raise RuntimeError(f"Failed to send request: sent {sent}, expected {raw_msg_len + 4}")
+
+        cdef unsigned char response_buffer[4096]
+        cdef ssize_t recvd = recv(self.clientfd, response_buffer, sizeof(response_buffer), 0)
+        if recvd <= 0:
+            print(f"Received {recvd} bytes, connection likely closed by server")
+            raise RuntimeError("Failed to receive response or connection closed")
+
+        if recvd < 4:
+            raise RuntimeError("Response too short to contain msg_len")
+        cdef uint32_t resp_msg_len = ntohl((<uint32_t *>response_buffer)[0])
+        if recvd < <ssize_t>(4 + resp_msg_len):
+            raise RuntimeError(f"Received {recvd} bytes, expected at least {4 + resp_msg_len}")
+
+        cdef int plaintext_len
+        cdef unsigned char *decrypted = <unsigned char *>malloc(resp_msg_len)
+        if decrypted == NULL:
+            raise MemoryError("Failed to allocate decryption buffer")
+        
+        if encrypt_tuple_decrypt(response_buffer + 4 + 12, resp_msg_len - 12, self.session_key, response_buffer + 4,
+                                 decrypted, &plaintext_len) != 0:
+            free(decrypted)
+            raise RuntimeError("Failed to decrypt response")
+
+        if op == OP_PUT:
+            if plaintext_len != sizeof(uint64_t):
+                free(decrypted)
+                raise RuntimeError(f"Invalid response size for PUT: got {plaintext_len}, expected {sizeof(uint64_t)}")
+            tuple_id = (<uint64_t *>decrypted)[0]
+            free(decrypted)
+            return tuple_id
+        elif op == OP_GET or op == OP_TAKE or op == OP_RLIST:
+            resp_tuple = tuple_deserialize(&decrypted, plaintext_len)
+            if resp_tuple == NULL:
+                free(decrypted)
+                raise RuntimeError("Failed to deserialize response tuple")
+            py_t = PyTuple(resp_tuple.elements_len)
+            py_t.c_tuple = resp_tuple
+            free(decrypted)
+            return py_t
+        elif op == OP_REMOVE:
+            if plaintext_len != sizeof(int):
+                free(decrypted)
+                raise RuntimeError(f"Invalid response size for REMOVE: got {plaintext_len}, expected {sizeof(int)}")
+            status = (<int *>decrypted)[0]
+            free(decrypted)
+            return status == 0
+        else:
+            free(decrypted)
+            raise RuntimeError("Unknown operation")
+
+    def put(self, PyTuple t):
+        return self.send_request(OP_PUT, t)
+
+    def get(self, uint64_t id):
+        return self.send_request(OP_GET, None, id)
+
+    def take(self, PyTuple t):
+        return self.send_request(OP_TAKE, t)
+
+    def remove(self, uint64_t id):
+        return self.send_request(OP_REMOVE, None, id)
+
+    def resource_query(self, uint64_t resource_id):
+        return self.send_request(OP_RLIST, None, resource_id)

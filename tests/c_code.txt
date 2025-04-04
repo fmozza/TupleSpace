@@ -1,0 +1,214 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include "network.h"
+
+int main()
+{
+    int server_fd = setup_server_socket();
+    if (server_fd < 0)
+        return 1;
+
+    int client_fd = accept_client(server_fd);
+    if (client_fd < 0)
+    {
+        close(server_fd);
+        return 1;
+    }
+
+    unsigned char *msg;
+    uint32_t msg_len;
+    if (receive_message(client_fd, &msg, &msg_len) < 0)
+    {
+        close(client_fd);
+        close(server_fd);
+        return 1;
+    }
+    printf("Server received: %.*s\n", (int)msg_len, msg);
+
+    // Echo back the message
+    if (send_message(client_fd, (unsigned char *)"echo", msg, msg_len) < 0)
+    {
+        free(msg);
+        close(client_fd);
+        close(server_fd);
+        return 1;
+    }
+
+    free(msg);
+    shutdown(client_fd, SHUT_RDWR);
+    close(client_fd);
+    shutdown(server_fd, SHUT_RDWR);
+    close(server_fd);
+    return 0;
+}// network.c
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h> // For setsockopt, already included
+#include <sys/time.h>   // Added for struct timeval
+#include "network.h"
+
+int setup_server_socket()
+{
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0)
+    {
+        perror("socket");
+        return -1;
+    }
+
+    int opt = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0)
+    {
+        perror("setsockopt SO_REUSEADDR");
+        return -1;
+    }
+
+    struct sockaddr_in addr = {AF_INET, htons(PORT), {INADDR_ANY}, {0}};
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+    {
+        perror("bind");
+        return -1;
+    }
+    if (listen(server_fd, 1) < 0)
+    {
+        perror("listen");
+        return -1;
+    }
+    printf("Server listening on port %d...\n", PORT);
+    return server_fd;
+}
+
+int accept_client(int server_fd)
+{
+    int client_fd = accept(server_fd, NULL, NULL);
+    if (client_fd < 0)
+    {
+        perror("accept");
+        return -1;
+    }
+    int flag = 1;
+    if (setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(int)) < 0)
+    {
+        perror("setsockopt TCP_NODELAY");
+        return -1;
+    }
+    struct timeval tv = {5, 0}; // 5-second timeout
+    if (setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0)
+    {
+        perror("setsockopt SO_RCVTIMEO");
+        return -1;
+    }
+    return client_fd;
+}
+
+int send_public_key(int client_fd, unsigned char *pub_key, size_t pub_len)
+{
+    if (write(client_fd, pub_key, pub_len) != pub_len)
+    {
+        perror("write server pub");
+        return -1;
+    }
+    return 0;
+}
+
+int receive_public_key(int client_fd, unsigned char *pub_key, size_t pub_len)
+{
+    if (read(client_fd, pub_key, pub_len) != pub_len)
+    {
+        perror("read client pub");
+        return -1;
+    }
+    return 0;
+}
+
+int receive_message(int client_fd, unsigned char **msg, uint32_t *msg_len)
+{
+    if (read(client_fd, msg_len, 4) != 4)
+    {
+        perror("read msg len");
+        return -1;
+    }
+    *msg_len = ntohl(*msg_len);
+    printf("Received message length: %u\n", *msg_len);
+
+    *msg = malloc(*msg_len);
+    if (!*msg)
+    {
+        perror("malloc msg");
+        return -1;
+    }
+
+    size_t total_read = 0;
+    while (total_read < *msg_len)
+    {
+        ssize_t bytes_read = read(client_fd, *msg + total_read, *msg_len - total_read);
+        if (bytes_read < 0)
+        {
+            perror("read msg");
+            printf("Bytes read: %zd, total %zu/%u\n", bytes_read, total_read, *msg_len);
+            free(*msg);
+            return -1;
+        }
+        if (bytes_read == 0)
+        {
+            printf("Connection closed by client or timeout: expected %u, got %zu\n", *msg_len, total_read);
+            free(*msg);
+            return -1;
+        }
+        total_read += bytes_read;
+        printf("Read %zd bytes, total %zu/%u, raw: ", bytes_read, total_read, *msg_len);
+        for (size_t i = total_read - bytes_read; i < total_read; i++)
+        {
+            printf("%02x", (*msg)[i]);
+        }
+        printf("\n");
+    }
+    printf("Message read successfully, %zu bytes\n", total_read);
+    return 0;
+}
+
+int send_message(int client_fd, unsigned char *nonce, unsigned char *ciphertext, int cipher_len)
+{
+    uint32_t total_len = htonl(NONCE_LEN + cipher_len);
+    if (write(client_fd, &total_len, 4) != 4)
+    {
+        perror("write total len");
+        return -1;
+    }
+    if (write(client_fd, nonce, NONCE_LEN) != NONCE_LEN)
+    {
+        perror("write nonce");
+        return -1;
+    }
+    if (write(client_fd, ciphertext, cipher_len) != cipher_len)
+    {
+        perror("write ciphertext");
+        return -1;
+    }
+    printf("Response sent successfully\n");
+    return 0;
+}#ifndef NETWORK_H
+#define NETWORK_H
+
+#include <stdint.h>
+
+#define PORT 12345
+#define NONCE_LEN 4     // Adjusted for plaintext test
+#define SPACE_ID_LEN 32 // Unused now, kept for future
+
+int setup_server_socket();
+int accept_client(int server_fd);
+int send_public_key(int client_fd, unsigned char *pub_key, size_t pub_len);
+int receive_public_key(int client_fd, unsigned char *pub_key, size_t pub_len);
+int receive_message(int client_fd, unsigned char **msg, uint32_t *msg_len);
+int send_message(int client_fd, unsigned char *nonce, unsigned char *ciphertext, int cipher_len);
+
+#endif

@@ -1,0 +1,44 @@
+from setuptools import setup, Extension
+from Cython.Build import cythonize
+import subprocess
+
+def get_pkg_config_cflags(*packages):
+    try:
+        cmd = ["pkg-config", "--cflags"] + list(packages)
+        output = subprocess.check_output(cmd, universal_newlines=True).strip()
+        return [flag[2:] for flag in output.split() if flag.startswith("-I")]
+    except subprocess.CalledProcessError:
+        return []
+
+def get_pkg_config_libs(*packages):
+    try:
+        cmd = ["pkg-config", "--libs"] + list(packages)
+        output = subprocess.check_output(cmd, universal_newlines=True).strip()
+        return output.split()
+    except subprocess.CalledProcessError:
+        return []
+
+include_dirs = ["."] + get_pkg_config_cflags("glib-2.0")
+extra_link_args = get_pkg_config_libs("glib-2.0")
+
+extensions = [
+    Extension(
+        "tuple_client",
+        sources=[
+            "cython_tuple_client.pyx",
+            "tuple.c",
+            "tuple_encrypt.c",
+            # Removed "tuple_network_client.c" since Cython includes it
+        ],
+        include_dirs=include_dirs,
+        libraries=["ssl", "crypto", "pthread"],
+        extra_compile_args=["-std=c11", "-Wall", "-Wextra", "-g"],
+        extra_link_args=extra_link_args,
+    )
+]
+
+setup(
+    name="tuple_client",
+    ext_modules=cythonize(extensions, compiler_directives={'language_level': "3"}),
+    zip_safe=False,
+)
