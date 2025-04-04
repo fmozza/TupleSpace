@@ -1,0 +1,10 @@
+# Ignore object files
+*.o
+*.so
+*.obj
+*.exe  # If you have Windows executables
+*.out  # Common for compiled outputs
+
+# Ignore build directories (if applicable)
+build/
+dist/
